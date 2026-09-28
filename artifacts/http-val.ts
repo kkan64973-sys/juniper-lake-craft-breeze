@@ -1,0 +1,456 @@
+// Val Town: HTTP val として作成し、このコードを貼り付け
+// 必要な環境変数: KERNEL_API_KEY (スクショ用), TMPDIR=/tmp
+//   GET /?url=...            → 経路 + HTML解析 (JSON)
+//   GET /?shot=1&url=...     → リモートブラウザで撮影したPNG
+//   GET /                    → 簡易UI
+import { isIP } from "node:net";
+
+const MAX_HOPS = 10;
+const TIMEOUT_MS = 8000;
+const MAX_BODY = 256 * 1024; // HTMLは先頭256KBまで
+const ALLOWED_PORTS = new Set(["", "80", "443"]);
+const UA = "Mozilla/5.0 (compatible; redirect-checker/2.0)";
+
+// ---------- IP判定 ----------
+function isBlockedV4(ip: string): boolean {
+  const [a, b] = ip.split(".").map(Number);
+  return (
+    a === 0 || a === 10 || a === 127 ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 192 && b === 0) ||
+    (a === 198 && (b === 18 || b === 19)) ||
+    a >= 224
+  );
+}
+
+function isBlockedV6(raw: string): boolean {
+  const ip = raw.toLowerCase();
+  if (ip === "::" || ip === "::1") return true;
+  const dotted = ip.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  if (dotted) return isBlockedV4(dotted[1]);
+  const hex = ip.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (hex) {
+    const hi = parseInt(hex[1], 16), lo = parseInt(hex[2], 16);
+    return isBlockedV4(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`);
+  }
+  const h = parseInt(ip.split(":")[0] || "0", 16);
+  return (
+    (h & 0xfe00) === 0xfc00 || (h & 0xffc0) === 0xfe80 ||
+    (h & 0xff00) === 0xff00 || h === 0x64 || h === 0x2002 ||
+    ip.startsWith("2001:db8")
+  );
+}
+
+const isBlockedIp = (ip: string) =>
+  isIP(ip) === 4 ? isBlockedV4(ip) : isBlockedV6(ip);
+
+// ---------- URL検証(ホップごとに毎回) ----------
+async function assertSafe(u: URL): Promise<void> {
+  if (u.protocol !== "http:" && u.protocol !== "https:") {
+    throw new Error("http/https 以外は対応していません");
+  }
+  if (u.username || u.password) throw new Error("認証情報つきURLは拒否します");
+  if (!ALLOWED_PORTS.has(u.port)) {
+    throw new Error(`ポート ${u.port} は許可されていません`);
+  }
+  const host = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (
+    host === "localhost" || host.endsWith(".localhost") ||
+    host.endsWith(".local") || host.endsWith(".internal")
+  ) {
+    throw new Error("内部向けホスト名は拒否します");
+  }
+  let ips: string[] = [];
+  if (isIP(host)) {
+    ips = [host];
+  } else {
+    const resolveDns = async (type: "A" | "AAAA"): Promise<string[]> => {
+      const endpoint = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(host)}&type=${type}`;
+      const res = await fetch(endpoint, {
+        headers: { Accept: "application/dns-json" },
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+      });
+      if (!res.ok) throw new Error(`DNS over HTTPS error: ${res.status}`);
+      const data = await res.json();
+      return (data.Answer ?? [])
+        .filter((answer: { type?: number }) => answer.type === (type === "A" ? 1 : 28))
+        .map((answer: { data: string }) => answer.data);
+    };
+    const [a, aaaa] = await Promise.allSettled([
+      resolveDns("A"),
+      resolveDns("AAAA"),
+    ]);
+    if (a.status === "fulfilled") ips.push(...a.value);
+    if (aaaa.status === "fulfilled") ips.push(...aaaa.value);
+  }
+  if (ips.length === 0) throw new Error("名前解決に失敗しました");
+  const bad = ips.find(isBlockedIp);
+  if (bad) throw new Error(`内部/予約アドレス (${bad}) に解決されるため拒否`);
+}
+
+// ---------- HTML解析(実行はせず、文字列として調べるだけ) ----------
+type PageInfo = {
+  title?: string;
+  description?: string;
+  passwordInputs: number;
+  iframes: number;
+  forms: { action: string; method: string; crossHost: boolean }[];
+  metaRefresh?: string;
+};
+
+function attr(tag: string, name: string): string | undefined {
+  const m = tag.match(
+    new RegExp(`\\b${name}\\s*=\\s*("([^"]*)"|'([^']*)'|([^\\s>]+))`, "i"),
+  );
+  return m ? (m[2] ?? m[3] ?? m[4]) : undefined;
+}
+
+function analyzeHtml(html: string, base: URL): PageInfo {
+  const title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]
+    ?.replace(/\s+/g, " ").trim().slice(0, 200);
+
+  let description: string | undefined;
+  let metaRefresh: string | undefined;
+  for (const m of html.matchAll(/<meta\b[^>]*>/gi)) {
+    const tag = m[0];
+    if (attr(tag, "name")?.toLowerCase() === "description") {
+      description = attr(tag, "content")?.slice(0, 300);
+    }
+    if (attr(tag, "http-equiv")?.toLowerCase() === "refresh") {
+      metaRefresh = attr(tag, "content")?.match(/url\s*=\s*['"]?([^'";\s]+)/i)?.[1];
+    }
+  }
+
+  const forms = [...html.matchAll(/<form\b[^>]*>/gi)].slice(0, 10).map((m) => {
+    let action = base.href;
+    try {
+      action = new URL(attr(m[0], "action") ?? "", base).href;
+    } catch { /* 不正なactionは現在のURL扱い */ }
+    return {
+      action,
+      method: (attr(m[0], "method") ?? "get").toUpperCase(),
+      crossHost: new URL(action).hostname !== base.hostname,
+    };
+  });
+
+  return {
+    title,
+    description,
+    passwordInputs: (html.match(/<input\b[^>]*type\s*=\s*["']?password/gi) ?? []).length,
+    iframes: (html.match(/<iframe\b/gi) ?? []).length,
+    forms,
+    metaRefresh,
+  };
+}
+
+// ---------- 1ホップ取得(HTMLのみ先頭だけ読む) ----------
+async function fetchHop(url: URL) {
+  const res = await fetch(url, {
+    method: "GET",
+    redirect: "manual",
+    signal: AbortSignal.timeout(TIMEOUT_MS),
+    headers: { "User-Agent": UA, Accept: "text/html,*/*;q=0.8" },
+  });
+  const isHtml = res.status >= 200 && res.status < 300 &&
+    (res.headers.get("content-type") ?? "").includes("html");
+  if (!isHtml || !res.body) {
+    await res.body?.cancel();
+    return { res, html: undefined as string | undefined };
+  }
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (total < MAX_BODY) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    total += value.length;
+  }
+  await reader.cancel();
+  return { res, html: await new Blob(chunks).text() };
+}
+
+// ---------- 経路追跡 ----------
+type Hop = {
+  url: string;
+  via?: string;
+  status?: number;
+  location?: string;
+  blocked?: string;
+  error?: string;
+};
+
+async function trace(input: string) {
+  const hops: Hop[] = [];
+  const seen = new Set<string>();
+  let url = new URL(input);
+  let via: string | undefined;
+  let page: PageInfo | undefined;
+  let note: string | undefined;
+
+  for (let i = 0; i <= MAX_HOPS; i++) {
+    if (seen.has(url.href)) {
+      note = "リダイレクトがループしています";
+      break;
+    }
+    seen.add(url.href);
+    const hop: Hop = { url: url.href, via };
+    via = undefined;
+    page = undefined;
+    hops.push(hop);
+
+    try {
+      await assertSafe(url);
+    } catch (e) {
+      hop.blocked = (e as Error).message;
+      break;
+    }
+
+    try {
+      const { res, html } = await fetchHop(url);
+      hop.status = res.status;
+
+      const loc = res.headers.get("location");
+      if (res.status >= 300 && res.status < 400 && loc) {
+        url = new URL(loc, url);
+        hop.location = url.href;
+        via = "HTTP";
+      } else if (html) {
+        page = analyzeHtml(html, url);
+        if (page.metaRefresh) {
+          url = new URL(page.metaRefresh, url);
+          hop.location = url.href;
+          via = "meta refresh";
+        }
+      }
+      if (!hop.location) break;
+      if (i === MAX_HOPS) note = `${MAX_HOPS}回を超えたため打ち切り`;
+    } catch (e) {
+      hop.error = (e as Error).name === "TimeoutError"
+        ? "タイムアウト"
+        : "接続に失敗しました";
+      break;
+    }
+  }
+
+  const last = hops[hops.length - 1];
+  const complete = last?.status !== undefined && !last.location &&
+    !last.blocked && !last.error;
+
+  return {
+    hops,
+    final: last?.url,
+    complete,
+    page: complete ? page : undefined,
+    warnings: complete ? makeWarnings(hops, page) : [],
+    note,
+    caveat:
+      "JavaScriptによる転送は静的解析では追えません(スクリーンショットで確認)。安全性の判定ではありません。",
+  };
+}
+
+// ---------- 注意点の抽出 ----------
+function makeWarnings(hops: Hop[], page?: PageInfo): string[] {
+  const w: string[] = [];
+  const last = new URL(hops[hops.length - 1].url);
+  const host = last.hostname.replace(/^\[|\]$/g, "");
+
+  if (hops.length > 4) w.push(`転送が${hops.length - 1}回あります`);
+  if (hops.some((h) => h.via === "meta refresh")) {
+    w.push("meta refresh による転送を含みます");
+  }
+  if (host.includes("xn--")) {
+    w.push("最終ドメインがpunycode(似せた偽ドメインの可能性)");
+  }
+  if (isIP(host)) w.push("最終到達先がIPアドレス直指定です");
+  if (last.protocol === "http:") w.push("最終到達先が暗号化されていません(http)");
+
+  if (page) {
+    if (page.passwordInputs > 0) w.push("パスワード入力欄があります");
+    const cross = page.forms.filter((f) => f.crossHost);
+    if (page.passwordInputs > 0 && cross.length > 0) {
+      w.push(`フォームの送信先が別ドメインです: ${new URL(cross[0].action).hostname}`);
+    }
+    if (page.iframes > 0) w.push(`iframeが${page.iframes}個あります`);
+  }
+  return w;
+}
+
+// ---------- スクリーンショット ----------
+// playwright-core を Val 側で読まない（OOM / 502 の原因だった）
+// Kernel 上で Playwright を実行して PNG を base64 で受け取る
+async function screenshot(url: string) {
+  const { default: Kernel } = await import("npm:@onkernel/sdk");
+  const kernel = new Kernel();
+  const kb = await kernel.browsers.create({
+    viewport: { width: 390, height: 844 },
+    kiosk_mode: true,
+  });
+  try {
+    const response = await kernel.browsers.playwright.execute(kb.session_id, {
+      code: `
+        await page.setViewportSize({ width: 390, height: 844 });
+        await page.goto(${JSON.stringify(url)}, { waitUntil: "domcontentloaded", timeout: 8000 });
+        await page.waitForTimeout(400);
+        const png = await page.screenshot({ type: "png" });
+        return { b64: Buffer.from(png).toString("base64"), pageUrl: page.url() };
+      `,
+      timeout_sec: 12,
+    });
+    const result = response.result as { b64: string; pageUrl: string };
+    const bin = Uint8Array.from(atob(result.b64), (c) => c.charCodeAt(0));
+    return { png: bin, pageUrl: result.pageUrl };
+  } finally {
+    await Promise.race([
+      kernel.browsers.deleteByID(kb.session_id).catch(() => undefined),
+      new Promise((r) => setTimeout(r, 1000)),
+    ]);
+  }
+}
+
+// ---------- UI ----------
+const PAGE = `<!doctype html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Redirect Checker</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:640px;margin:0 auto;padding:16px}
+input{width:100%;padding:12px;font-size:16px;box-sizing:border-box}
+button{margin-top:8px;padding:12px 16px;font-size:16px}
+.hop{border-left:4px solid #888;padding:6px 10px;margin:10px 0;word-break:break-all;white-space:pre-wrap}
+.ng{border-color:#d33}.ok{border-color:#2a7}
+img{max-width:100%;border:1px solid #888;margin-top:8px}
+</style></head><body>
+<h1>Redirect Checker</h1>
+<input id="u" type="url" placeholder="https://example.com/..." autocomplete="off">
+<button id="go">確認する</button>
+<div id="out"></div>
+<script>
+const out=document.getElementById("out");
+function add(cls,text){const d=document.createElement("div");d.className="hop "+cls;d.textContent=text;out.appendChild(d);}
+
+async function shot(url,finalUrl,btn){
+  btn.disabled=true;btn.textContent="撮影中…(10〜30秒)";
+  try{
+    const r=await fetch("?shot=1&url="+encodeURIComponent(url));
+    if(!r.ok){
+      const body=await r.text();
+      let detail="";
+      try{detail=JSON.parse(body).error||"";}catch{}
+      if(!detail)detail=body.slice(0,1000)||"レスポンス本文が空です";
+      throw new Error("HTTP "+r.status+" "+(r.statusText||"")+"\\n"+detail);
+    }
+    const pageUrl=decodeURIComponent(r.headers.get("X-Page-Url")||"");
+    if(pageUrl&&pageUrl!==finalUrl)add("ng","⚠ ブラウザ上の最終URLが異なります(JS転送の可能性)\\n"+pageUrl);
+    else add("ok","ブラウザ上の最終URLも一致しました");
+    const img=document.createElement("img");
+    img.src=URL.createObjectURL(await r.blob());
+    out.appendChild(img);
+    btn.remove();
+  }catch(e){const msg=e&&e.message?e.message:String(e);add("ng",msg);btn.disabled=false;btn.textContent="再試行";}
+}
+
+document.getElementById("go").onclick=async()=>{
+  out.textContent="確認中…";
+  try{
+    const url=document.getElementById("u").value;
+    const r=await fetch("?url="+encodeURIComponent(url));
+    const body=await r.text();
+    let j;
+    try{j=JSON.parse(body);}catch{
+      throw new Error("HTTP "+r.status+" "+(r.statusText||"")+"\\n"+(body.slice(0,1000)||"レスポンス本文が空です"));
+    }
+    out.textContent="";
+    if(!r.ok||j.error){add("ng",j.error||("HTTP "+r.status));return;}
+    (j.warnings||[]).forEach(w=>add("ng","⚠ "+w));
+    j.hops.forEach((h,i)=>{
+      const bad=h.blocked||h.error;
+      add(bad?"ng":"",(i+1)+". "+h.url+"\\n"+(h.via?"["+h.via+"] ":"")+(h.status?"status "+h.status:"")+(h.blocked?"拒否: "+h.blocked:"")+(h.error?h.error:""));
+    });
+    if(j.note)add("",j.note);
+    if(j.page){
+      add("","タイトル: "+(j.page.title||"(なし)")+(j.page.description?"\\n説明: "+j.page.description:""));
+      j.page.forms.forEach(f=>add(f.crossHost?"ng":"","フォーム("+f.method+") → "+f.action));
+    }
+    add(j.complete?"ok":"","最終到達先: "+j.final);
+    add("",j.caveat);
+    if(j.complete){
+      const b=document.createElement("button");
+      b.textContent="スクリーンショットを撮る";
+      b.onclick=()=>shot(url,j.final,b);
+      out.appendChild(b);
+    }
+  }catch(e){
+    out.textContent="";
+    add("ng",e&&e.message?e.message:String(e));
+  }
+};
+</script></body></html>`;
+
+// ---------- ハンドラ ----------
+export default async function (req: Request): Promise<Response> {
+  const params = new URL(req.url).searchParams;
+  const target = params.get("url")?.trim();
+  if (!target) {
+    return new Response(PAGE, {
+      headers: { "Content-Type": "text/html; charset=utf-8" },
+    });
+  }
+  if (target.length > 2048) {
+    return Response.json({ error: "URLが長すぎます" }, { status: 400 });
+  }
+
+  let normalized: string;
+  try {
+    normalized = new URL(
+      /^[a-z][a-z0-9+.-]*:/i.test(target) ? target : `https://${target}`,
+    ).href;
+  } catch {
+    return Response.json({ error: "URLの形式が不正です" }, { status: 400 });
+  }
+
+  // スクショ: クライアントのURLは信用せず、必ずサーバー側で再検証してから渡す
+  if (params.get("shot")) {
+    let t;
+    try {
+      t = await Promise.race([
+        trace(normalized),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("リダイレクト確認がタイムアウトしました (10000ms)")), 10000),
+        ),
+      ]);
+    } catch (e) {
+      const detail = e instanceof Error ? e.message : String(e);
+      return Response.json(
+        { error: `撮影前のリダイレクト確認に失敗しました: ${detail}` },
+        { status: 504 },
+      );
+    }
+    if (!t.complete || !t.final) {
+      return Response.json(
+        { error: "到達を確認できないURLは撮影しません" },
+        { status: 400 },
+      );
+    }
+    try {
+      const { png, pageUrl } = await screenshot(t.final);
+      return new Response(png, {
+        headers: {
+          "Content-Type": "image/png",
+          "Cache-Control": "no-store",
+          "X-Page-Url": encodeURIComponent(pageUrl),
+        },
+      });
+    } catch (e) {
+      const detail = e instanceof Error ? e.message : String(e);
+      return Response.json(
+        { error: `撮影に失敗しました: ${detail}` },
+        { status: 502 },
+      );
+    }
+  }
+
+  return Response.json(await trace(normalized));
+}

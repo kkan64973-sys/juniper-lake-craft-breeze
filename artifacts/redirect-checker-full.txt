@@ -1,0 +1,1601 @@
+Redirect Checker — ソース全文
+================================
+このファイルはアプリ本体のソースです。
+区切り線の次の行から各ファイルの中身です。
+
+
+========================================================================
+FILE: src/router.tsx
+========================================================================
+import { createRouter } from "@tanstack/react-router";
+import { AppErrorComponent } from "@/lib/error-component";
+import { routeTree } from "./routeTree.gen";
+
+export function getRouter() {
+  return createRouter({ routeTree, defaultErrorComponent: AppErrorComponent });
+}
+
+========================================================================
+FILE: src/routes/__root.tsx
+========================================================================
+import { createRootRoute, HeadContent, Outlet, Scripts } from "@tanstack/react-router";
+import { AuthProvider } from "@/lib/auth/provider";
+import { PreviewHostBridge } from "@/components/preview-host-bridge";
+import appCss from "../styles.css?url";
+
+const APP_NAME = "Redirect Checker";
+
+export const Route = createRootRoute({
+  head: () => ({
+    meta: [
+      { charSet: "utf-8" },
+      { name: "viewport", content: "width=device-width, initial-scale=1" },
+      { title: APP_NAME },
+      {
+        name: "description",
+        content:
+          "短縮URLやリダイレクト経路を追跡し、到達先ページのスクリーンショットまで確認します。",
+      },
+      { name: "theme-color", content: "#0c0d0f" },
+    ],
+    links: [
+      { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" },
+      { rel: "stylesheet", href: appCss },
+      { rel: "manifest", href: "/__grok/manifest.webmanifest" },
+      { rel: "apple-touch-icon", href: "/__grok/icon-180.png" },
+    ],
+  }),
+  component: () => (
+    <html lang="ja" className="antialiased" suppressHydrationWarning>
+      <head>
+        <HeadContent />
+      </head>
+      <body className="bg-bg text-foreground">
+        <PreviewHostBridge />
+        <AuthProvider>
+          <Outlet />
+        </AuthProvider>
+        <Scripts />
+      </body>
+    </html>
+  ),
+});
+
+========================================================================
+FILE: src/routes/index.tsx
+========================================================================
+import { createFileRoute } from "@tanstack/react-router";
+import { CheckerApp } from "@/components/checker-app";
+
+export const Route = createFileRoute("/")({ component: Home });
+
+function Home() {
+  return <CheckerApp />;
+}
+
+========================================================================
+FILE: src/routes/api/trace.ts
+========================================================================
+import { createFileRoute } from "@tanstack/react-router";
+import { normalizeInputUrl } from "@/lib/redirect/ssrf";
+import { trace } from "@/lib/redirect/trace";
+
+export const Route = createFileRoute("/api/trace")({
+  server: {
+    handlers: {
+      POST: async ({ request }) => {
+        let body: unknown;
+        try {
+          body = await request.json();
+        } catch {
+          return Response.json({ error: "JSONが不正です" }, { status: 400 });
+        }
+        const raw =
+          typeof body === "object" &&
+          body !== null &&
+          "url" in body &&
+          typeof body.url === "string"
+            ? body.url
+            : "";
+
+        let normalized: string;
+        try {
+          normalized = normalizeInputUrl(raw);
+        } catch (e) {
+          return Response.json(
+            { error: e instanceof Error ? e.message : "URLの形式が不正です" },
+            { status: 400 },
+          );
+        }
+
+        try {
+          const result = await trace(normalized);
+          return Response.json(result, {
+            headers: { "Cache-Control": "no-store" },
+          });
+        } catch (e) {
+          return Response.json(
+            {
+              error:
+                e instanceof Error ? e.message : "確認に失敗しました",
+            },
+            { status: 502 },
+          );
+        }
+      },
+    },
+  },
+});
+
+========================================================================
+FILE: src/routes/api/shot.ts
+========================================================================
+import { createFileRoute } from "@tanstack/react-router";
+import { normalizeInputUrl } from "@/lib/redirect/ssrf";
+import { captureScreenshot } from "@/lib/redirect/screenshot";
+
+export const Route = createFileRoute("/api/shot")({
+  server: {
+    handlers: {
+      POST: async ({ request }) => {
+        let body: unknown;
+        try {
+          body = await request.json();
+        } catch {
+          return Response.json({ error: "JSONが不正です" }, { status: 400 });
+        }
+        const raw =
+          typeof body === "object" &&
+          body !== null &&
+          "url" in body &&
+          typeof body.url === "string"
+            ? body.url
+            : "";
+
+        let normalized: string;
+        try {
+          normalized = normalizeInputUrl(raw);
+        } catch (e) {
+          return Response.json(
+            { error: e instanceof Error ? e.message : "URLの形式が不正です" },
+            { status: 400 },
+          );
+        }
+
+        try {
+          const { png, pageUrl } = await captureScreenshot(normalized);
+          return new Response(new Uint8Array(png), {
+            headers: {
+              "Content-Type": "image/png",
+              "Cache-Control": "no-store",
+              "X-Page-Url": encodeURIComponent(pageUrl),
+            },
+          });
+        } catch (e) {
+          const detail = e instanceof Error ? e.message : String(e);
+          const timedOut = /タイムアウト/.test(detail);
+          return Response.json(
+            { error: detail },
+            { status: timedOut ? 504 : 502 },
+          );
+        }
+      },
+    },
+  },
+});
+
+========================================================================
+FILE: src/styles.css
+========================================================================
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap");
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  --color-bg: #0c0d0f;
+  --color-surface: #15171c;
+  --color-elevated: #1c1f26;
+  --color-muted: #1f232b;
+  --color-foreground: #ecece8;
+  --color-muted-foreground: #8b8e98;
+  --color-subtle: #6b6e78;
+  --color-border: rgb(236 236 232 / 0.12);
+  --color-ring: #c8ccd4;
+  --color-primary: #d8dbe3;
+  --color-primary-foreground: #0c0d0f;
+  --color-secondary: #1f232b;
+  --color-secondary-foreground: #ecece8;
+  --color-ok: #7d9b8a;
+  --color-ok-foreground: #0c0d0f;
+  --color-ok-soft: rgb(125 155 138 / 0.16);
+  --color-warn: #c4a574;
+  --color-warn-foreground: #0c0d0f;
+  --color-warn-soft: rgb(196 165 116 / 0.16);
+  --color-danger: #c27b7b;
+  --color-danger-foreground: #0c0d0f;
+  --color-danger-soft: rgb(194 123 123 / 0.16);
+
+  --radius-xs: 4px;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 24px;
+  --radius-2xl: 28px;
+
+  --shadow-border: 0 0 0 1px rgb(255 255 255 / 0.08);
+  --shadow-border-hover: 0 0 0 1px rgb(255 255 255 / 0.13);
+
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-smooth-out: cubic-bezier(0.22, 1, 0.36, 1);
+
+  --motion-stagger: 40ms;
+  --motion-micro: 80ms;
+  --motion-quick: 150ms;
+  --motion-fast: 250ms;
+  --motion-medium: 350ms;
+  --motion-slow: 400ms;
+}
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  html,
+  body,
+  #app {
+    min-height: 100%;
+    background: var(--color-bg);
+    color: var(--color-foreground);
+  }
+
+  body {
+    font-family: var(--font-sans);
+    line-height: 1.5;
+  }
+
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+
+  ::selection {
+    background: color-mix(in oklab, var(--color-primary) 30%, transparent);
+    color: var(--color-foreground);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+========================================================================
+FILE: src/lib/utils.ts
+========================================================================
+import { clsx, type ClassValue } from "clsx";
+import { twMerge } from "tailwind-merge";
+
+export function cn(...inputs: ClassValue[]) {
+  return twMerge(clsx(inputs));
+}
+
+========================================================================
+FILE: src/lib/redirect/types.ts
+========================================================================
+export type FormInfo = {
+  action: string;
+  method: string;
+  crossHost: boolean;
+};
+
+export type PageInfo = {
+  title?: string;
+  description?: string;
+  passwordInputs: number;
+  iframes: number;
+  forms: FormInfo[];
+  metaRefresh?: string;
+};
+
+export type Hop = {
+  url: string;
+  via?: string;
+  status?: number;
+  location?: string;
+  blocked?: string;
+  error?: string;
+};
+
+export type TraceResult = {
+  hops: Hop[];
+  final?: string;
+  complete: boolean;
+  page?: PageInfo;
+  warnings: string[];
+  note?: string;
+  caveat: string;
+  error?: string;
+};
+
+========================================================================
+FILE: src/lib/redirect/ssrf.ts
+========================================================================
+import { isIP } from "node:net";
+import { Resolver } from "node:dns/promises";
+
+const TIMEOUT_MS = 8000;
+const ALLOWED_PORTS = new Set(["", "80", "443"]);
+
+export function isBlockedV4(ip: string): boolean {
+  const [a, b] = ip.split(".").map(Number);
+  return (
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 192 && b === 0) ||
+    (a === 198 && (b === 18 || b === 19)) ||
+    a >= 224
+  );
+}
+
+export function isBlockedV6(raw: string): boolean {
+  const ip = raw.toLowerCase();
+  if (ip === "::" || ip === "::1") return true;
+  const dotted = ip.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  if (dotted) return isBlockedV4(dotted[1]);
+  const hex = ip.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (hex) {
+    const hi = parseInt(hex[1], 16);
+    const lo = parseInt(hex[2], 16);
+    return isBlockedV4(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`);
+  }
+  const h = parseInt(ip.split(":")[0] || "0", 16);
+  return (
+    (h & 0xfe00) === 0xfc00 ||
+    (h & 0xffc0) === 0xfe80 ||
+    (h & 0xff00) === 0xff00 ||
+    h === 0x64 ||
+    h === 0x2002 ||
+    ip.startsWith("2001:db8")
+  );
+}
+
+export const isBlockedIp = (ip: string) =>
+  isIP(ip) === 4 ? isBlockedV4(ip) : isIP(ip) === 6 ? isBlockedV6(ip) : true;
+
+async function resolveDoh(host: string, type: "A" | "AAAA"): Promise<string[]> {
+  const endpoint = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(host)}&type=${type}`;
+  const res = await fetch(endpoint, {
+    headers: { Accept: "application/dns-json" },
+    signal: AbortSignal.timeout(TIMEOUT_MS),
+  });
+  if (!res.ok) throw new Error(`DNS over HTTPS error: ${res.status}`);
+  const data = (await res.json()) as {
+    Answer?: { type?: number; data: string }[];
+  };
+  const want = type === "A" ? 1 : 28;
+  return (data.Answer ?? [])
+    .filter((answer) => answer.type === want)
+    .map((answer) => answer.data.replace(/\.$/, ""));
+}
+
+async function resolveSystem(host: string): Promise<string[]> {
+  const resolver = new Resolver();
+  resolver.setServers(["1.1.1.1", "8.8.8.8"]);
+  const ips: string[] = [];
+  const [a, aaaa] = await Promise.allSettled([
+    resolver.resolve4(host),
+    resolver.resolve6(host),
+  ]);
+  if (a.status === "fulfilled") ips.push(...a.value);
+  if (aaaa.status === "fulfilled") ips.push(...aaaa.value);
+  return ips;
+}
+
+export async function assertSafe(u: URL): Promise<void> {
+  if (u.protocol !== "http:" && u.protocol !== "https:") {
+    throw new Error("http/https 以外は対応していません");
+  }
+  if (u.username || u.password) throw new Error("認証情報つきURLは拒否します");
+  if (!ALLOWED_PORTS.has(u.port)) {
+    throw new Error(`ポート ${u.port} は許可されていません`);
+  }
+  const host = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".local") ||
+    host.endsWith(".internal") ||
+    host.endsWith(".arpa")
+  ) {
+    throw new Error("内部向けホスト名は拒否します");
+  }
+
+  let ips: string[] = [];
+  if (isIP(host)) {
+    ips = [host];
+  } else {
+    const [a, aaaa] = await Promise.allSettled([
+      resolveDoh(host, "A"),
+      resolveDoh(host, "AAAA"),
+    ]);
+    if (a.status === "fulfilled") ips.push(...a.value);
+    if (aaaa.status === "fulfilled") ips.push(...aaaa.value);
+    if (ips.length === 0) {
+      try {
+        ips.push(...(await resolveSystem(host)));
+      } catch {
+        /* resolve failure handled below */
+      }
+    }
+  }
+  if (ips.length === 0) throw new Error("名前解決に失敗しました");
+  const bad = ips.find(isBlockedIp);
+  if (bad) throw new Error(`内部/予約アドレス (${bad}) に解決されるため拒否`);
+}
+
+export function normalizeInputUrl(raw: string): string {
+  const target = raw.trim();
+  if (!target) throw new Error("URLを入力してください");
+  if (target.length > 2048) throw new Error("URLが長すぎます");
+  return new URL(
+    /^[a-z][a-z0-9+.-]*:/i.test(target) ? target : `https://${target}`,
+  ).href;
+}
+
+========================================================================
+FILE: src/lib/redirect/html.ts
+========================================================================
+import type { PageInfo } from "./types";
+
+function attr(tag: string, name: string): string | undefined {
+  const m = tag.match(
+    new RegExp(`\\b${name}\\s*=\\s*("([^"]*)"|'([^']*)'|([^\\s>]+))`, "i"),
+  );
+  return m ? (m[2] ?? m[3] ?? m[4]) : undefined;
+}
+
+export function analyzeHtml(html: string, base: URL): PageInfo {
+  const title = html
+    .match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]
+    ?.replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 200);
+
+  let description: string | undefined;
+  let metaRefresh: string | undefined;
+  for (const m of html.matchAll(/<meta\b[^>]*>/gi)) {
+    const tag = m[0];
+    if (attr(tag, "name")?.toLowerCase() === "description") {
+      description = attr(tag, "content")?.slice(0, 300);
+    }
+    if (attr(tag, "http-equiv")?.toLowerCase() === "refresh") {
+      metaRefresh = attr(tag, "content")?.match(
+        /url\s*=\s*['"]?([^'";\s]+)/i,
+      )?.[1];
+    }
+  }
+
+  const forms = [...html.matchAll(/<form\b[^>]*>/gi)].slice(0, 10).map((m) => {
+    let action = base.href;
+    try {
+      action = new URL(attr(m[0], "action") ?? "", base).href;
+    } catch {
+      /* keep current URL */
+    }
+    let crossHost = false;
+    try {
+      crossHost = new URL(action).hostname !== base.hostname;
+    } catch {
+      crossHost = false;
+    }
+    return {
+      action,
+      method: (attr(m[0], "method") ?? "get").toUpperCase(),
+      crossHost,
+    };
+  });
+
+  return {
+    title,
+    description,
+    passwordInputs: (html.match(/<input\b[^>]*type\s*=\s*["']?password/gi) ?? [])
+      .length,
+    iframes: (html.match(/<iframe\b/gi) ?? []).length,
+    forms,
+    metaRefresh,
+  };
+}
+
+========================================================================
+FILE: src/lib/redirect/trace.ts
+========================================================================
+import { isIP } from "node:net";
+import { analyzeHtml } from "./html";
+import { assertSafe } from "./ssrf";
+import type { Hop, PageInfo, TraceResult } from "./types";
+
+const MAX_HOPS = 10;
+const TIMEOUT_MS = 8000;
+const MAX_BODY = 256 * 1024;
+const UA = "Mozilla/5.0 (compatible; redirect-checker/3.0)";
+
+const CAVEAT =
+  "JavaScriptによる転送は静的解析では追えません（スクリーンショットで確認）。安全性の判定ではありません。";
+
+async function fetchHop(url: URL) {
+  const res = await fetch(url, {
+    method: "GET",
+    redirect: "manual",
+    signal: AbortSignal.timeout(TIMEOUT_MS),
+    headers: { "User-Agent": UA, Accept: "text/html,*/*;q=0.8" },
+  });
+  const isHtml =
+    res.status >= 200 &&
+    res.status < 300 &&
+    (res.headers.get("content-type") ?? "").includes("html");
+  if (!isHtml || !res.body) {
+    await res.body?.cancel();
+    return { res, html: undefined as string | undefined };
+  }
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (total < MAX_BODY) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    total += value.length;
+  }
+  await reader.cancel();
+  const buf = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    buf.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return { res, html: new TextDecoder("utf-8").decode(buf) };
+}
+
+function makeWarnings(hops: Hop[], page?: PageInfo): string[] {
+  const w: string[] = [];
+  const last = new URL(hops[hops.length - 1].url);
+  const host = last.hostname.replace(/^\[|\]$/g, "");
+
+  if (hops.length > 4) w.push(`転送が${hops.length - 1}回あります`);
+  if (hops.some((h) => h.via === "meta refresh")) {
+    w.push("meta refresh による転送を含みます");
+  }
+  if (host.includes("xn--")) {
+    w.push("最終ドメインがpunycode（似せた偽ドメインの可能性）");
+  }
+  if (isIP(host)) w.push("最終到達先がIPアドレス直指定です");
+  if (last.protocol === "http:") {
+    w.push("最終到達先が暗号化されていません (http)");
+  }
+
+  if (page) {
+    if (page.passwordInputs > 0) w.push("パスワード入力欄があります");
+    const cross = page.forms.filter((f) => f.crossHost);
+    if (page.passwordInputs > 0 && cross.length > 0) {
+      w.push(
+        `フォームの送信先が別ドメインです: ${new URL(cross[0].action).hostname}`,
+      );
+    }
+    if (page.iframes > 0) w.push(`iframeが${page.iframes}個あります`);
+  }
+  return w;
+}
+
+export async function trace(input: string): Promise<TraceResult> {
+  const hops: Hop[] = [];
+  const seen = new Set<string>();
+  let url = new URL(input);
+  let via: string | undefined;
+  let page: PageInfo | undefined;
+  let note: string | undefined;
+
+  for (let i = 0; i <= MAX_HOPS; i++) {
+    if (seen.has(url.href)) {
+      note = "リダイレクトがループしています";
+      break;
+    }
+    seen.add(url.href);
+    const hop: Hop = { url: url.href, via };
+    via = undefined;
+    page = undefined;
+    hops.push(hop);
+
+    try {
+      await assertSafe(url);
+    } catch (e) {
+      hop.blocked = (e as Error).message;
+      break;
+    }
+
+    try {
+      const { res, html } = await fetchHop(url);
+      hop.status = res.status;
+
+      const loc = res.headers.get("location");
+      if (res.status >= 300 && res.status < 400 && loc) {
+        url = new URL(loc, url);
+        hop.location = url.href;
+        via = "HTTP";
+      } else if (html) {
+        page = analyzeHtml(html, url);
+        if (page.metaRefresh) {
+          url = new URL(page.metaRefresh, url);
+          hop.location = url.href;
+          via = "meta refresh";
+        }
+      }
+      if (!hop.location) break;
+      if (i === MAX_HOPS) note = `${MAX_HOPS}回を超えたため打ち切り`;
+    } catch (e) {
+      hop.error =
+        (e as Error).name === "TimeoutError" ||
+        (e as Error).name === "AbortError"
+          ? "タイムアウト"
+          : "接続に失敗しました";
+      break;
+    }
+  }
+
+  const last = hops[hops.length - 1];
+  const complete =
+    last?.status !== undefined && !last.location && !last.blocked && !last.error;
+
+  return {
+    hops,
+    final: last?.url,
+    complete,
+    page: complete ? page : undefined,
+    warnings: complete ? makeWarnings(hops, page) : [],
+    note,
+    caveat: CAVEAT,
+  };
+}
+
+========================================================================
+FILE: src/lib/redirect/screenshot.ts
+========================================================================
+import { existsSync, readdirSync } from "node:fs";
+import { join } from "node:path";
+import { isIP } from "node:net";
+import { assertSafe, isBlockedIp } from "./ssrf";
+import { trace } from "./trace";
+
+const TOTAL_LIMIT_MS = 12000;
+const VIEWPORT = { width: 390, height: 844 };
+const UA =
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1";
+
+export type ShotResult = {
+  png: Buffer;
+  pageUrl: string;
+};
+
+function remaining(started: number) {
+  return Math.max(400, TOTAL_LIMIT_MS - (Date.now() - started));
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function timed<T>(
+  operation: Promise<T>,
+  ms: number,
+  label: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${label} がタイムアウトしました (${ms}ms)`)),
+          ms,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function findChrome(): string | undefined {
+  const envPath =
+    process.env.PLAYWRIGHT_CHROMIUM_PATH || process.env.CHROME_PATH;
+  if (envPath && existsSync(envPath)) return envPath;
+
+  const root = process.env.PLAYWRIGHT_BROWSERS_PATH;
+  if (!root || !existsSync(root)) return undefined;
+  try {
+    for (const dir of readdirSync(root)) {
+      if (!dir.startsWith("chromium")) continue;
+      const candidate = join(root, dir, "chrome-linux64", "chrome");
+      if (existsSync(candidate)) return candidate;
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+function isUnsafeUrl(raw: string): boolean {
+  try {
+    const u = new URL(raw);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return true;
+    const host = u.hostname.replace(/^\[|\]$/g, "");
+    if (
+      host === "localhost" ||
+      host.endsWith(".localhost") ||
+      host.endsWith(".local") ||
+      host.endsWith(".internal")
+    ) {
+      return true;
+    }
+    if (isIP(host) && isBlockedIp(host)) return true;
+    if (u.port && u.port !== "80" && u.port !== "443") return true;
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+type PlaywrightModule = typeof import("playwright-core");
+
+let chromiumImport: Promise<PlaywrightModule["chromium"]> | undefined;
+let browserPromise: Promise<import("playwright-core").Browser> | undefined;
+
+async function loadChromium() {
+  if (!chromiumImport) {
+    chromiumImport = import("playwright-core")
+      .then((mod) => mod.chromium)
+      .catch((err) => {
+        chromiumImport = undefined;
+        throw err;
+      });
+  }
+  return chromiumImport;
+}
+
+async function getBrowser() {
+  if (!browserPromise) {
+    browserPromise = (async () => {
+      const chromium = await loadChromium();
+      const executablePath = findChrome();
+      return chromium.launch({
+        headless: true,
+        executablePath,
+        args: [
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-gpu",
+          "--disable-extensions",
+          "--hide-scrollbars",
+        ],
+      });
+    })().catch((err) => {
+      browserPromise = undefined;
+      throw err;
+    });
+  }
+  return browserPromise;
+}
+
+async function screenshotWithPlaywright(
+  url: string,
+  started: number,
+): Promise<ShotResult> {
+  const browser = await timed(
+    getBrowser(),
+    Math.min(4000, remaining(started)),
+    "ブラウザ起動",
+  );
+  const context = await browser.newContext({
+    viewport: VIEWPORT,
+    userAgent: UA,
+    javaScriptEnabled: true,
+    bypassCSP: false,
+    locale: "ja-JP",
+  });
+
+  try {
+    const page = await context.newPage();
+    page.setDefaultTimeout(Math.min(8000, remaining(started)));
+
+    await page.route("**/*", async (route) => {
+      const reqUrl = route.request().url();
+      if (isUnsafeUrl(reqUrl)) {
+        await route.abort("blockedbyclient");
+        return;
+      }
+      await route.continue();
+    });
+
+    await timed(
+      page.goto(url, {
+        waitUntil: "domcontentloaded",
+        timeout: Math.min(8000, remaining(started)),
+      }),
+      Math.min(8500, remaining(started)),
+      "ページ読み込み",
+    );
+
+    await sleep(Math.min(450, remaining(started)));
+
+    const pageUrl = page.url();
+    if (isUnsafeUrl(pageUrl)) {
+      throw new Error("ブラウザが内部向けURLへ遷移したため中止しました");
+    }
+    await assertSafe(new URL(pageUrl));
+
+    const png = await timed(
+      page.screenshot({ type: "png", animations: "disabled" }),
+      Math.min(3000, remaining(started)),
+      "PNG 撮影",
+    );
+
+    return { png: Buffer.from(png), pageUrl };
+  } finally {
+    await Promise.race([context.close().catch(() => undefined), sleep(800)]);
+  }
+}
+
+async function screenshotWithMicrolink(
+  url: string,
+  started: number,
+): Promise<ShotResult> {
+  const endpoint = new URL("https://api.microlink.io/");
+  endpoint.searchParams.set("url", url);
+  endpoint.searchParams.set("screenshot", "true");
+  endpoint.searchParams.set("meta", "false");
+  endpoint.searchParams.set("viewport.width", String(VIEWPORT.width));
+  endpoint.searchParams.set("viewport.height", String(VIEWPORT.height));
+
+  const res = await timed(
+    fetch(endpoint, { signal: AbortSignal.timeout(Math.min(8000, remaining(started))) }),
+    Math.min(8500, remaining(started)),
+    "Microlink 撮影",
+  );
+  if (!res.ok) throw new Error(`Microlink HTTP ${res.status}`);
+  const data = (await res.json()) as {
+    status?: string;
+    data?: { url?: string; screenshot?: { url?: string } };
+  };
+  const shot = data.data?.screenshot?.url;
+  if (data.status !== "success" || !shot) {
+    throw new Error("Microlink が画像を返しませんでした");
+  }
+  const img = await timed(
+    fetch(shot, { signal: AbortSignal.timeout(Math.min(5000, remaining(started))) }),
+    Math.min(5500, remaining(started)),
+    "Microlink 画像取得",
+  );
+  if (!img.ok) throw new Error(`Microlink 画像 HTTP ${img.status}`);
+  const png = Buffer.from(await img.arrayBuffer());
+  if (png.length < 800) throw new Error("Microlink 画像が不正です");
+  return { png, pageUrl: data.data?.url || url };
+}
+
+async function screenshotWithThum(
+  url: string,
+  started: number,
+): Promise<ShotResult> {
+  const shot = `https://image.thum.io/get/width/${VIEWPORT.width}/crop/${VIEWPORT.height}/noanimate/${url}`;
+  const res = await timed(
+    fetch(shot, { signal: AbortSignal.timeout(Math.min(8000, remaining(started))) }),
+    Math.min(8500, remaining(started)),
+    "thum.io 撮影",
+  );
+  if (!res.ok) throw new Error(`thum.io HTTP ${res.status}`);
+  const ctype = res.headers.get("content-type") ?? "";
+  if (!ctype.includes("image/")) throw new Error("thum.io が画像以外を返しました");
+  const png = Buffer.from(await res.arrayBuffer());
+  if (png.length < 800) throw new Error("thum.io 画像が不正です");
+  return { png, pageUrl: url };
+}
+
+export async function captureScreenshot(inputUrl: string): Promise<ShotResult> {
+  const started = Date.now();
+
+  const traced = await timed(
+    trace(inputUrl),
+    Math.min(7000, remaining(started)),
+    "リダイレクト確認",
+  );
+
+  if (!traced.complete || !traced.final) {
+    throw new Error("到達を確認できないURLは撮影しません");
+  }
+
+  await assertSafe(new URL(traced.final));
+
+  const errors: string[] = [];
+  try {
+    return await screenshotWithPlaywright(traced.final, started);
+  } catch (e) {
+    errors.push(e instanceof Error ? e.message : String(e));
+  }
+
+  try {
+    return await screenshotWithMicrolink(traced.final, started);
+  } catch (e) {
+    errors.push(e instanceof Error ? e.message : String(e));
+  }
+
+  try {
+    return await screenshotWithThum(traced.final, started);
+  } catch (e) {
+    errors.push(e instanceof Error ? e.message : String(e));
+  }
+
+  throw new Error(`撮影に失敗しました: ${errors[0] ?? "原因不明"}`);
+}
+
+========================================================================
+FILE: src/lib/redirect/api-error.ts
+========================================================================
+export async function readApiError(
+  res: Response,
+  fallback: string,
+): Promise<string> {
+  const ct = res.headers.get("content-type") ?? "";
+  const text = await res.text();
+
+  if (ct.includes("application/json") && text) {
+    try {
+      const parsed = JSON.parse(text) as { error?: unknown };
+      if (typeof parsed.error === "string" && parsed.error.trim()) {
+        return parsed.error;
+      }
+    } catch {
+      /* fall through */
+    }
+  }
+
+  if (res.status === 502 || res.status === 504) {
+    return "接続がタイムアウトしました。もう一度試してください。";
+  }
+
+  if (text.trim().startsWith("<!")) {
+    return `サーバーエラー (HTTP ${res.status})。もう一度試してください。`;
+  }
+
+  const clipped = text.replace(/\s+/g, " ").trim().slice(0, 280);
+  return clipped || fallback;
+}
+
+========================================================================
+FILE: src/components/ui/button.tsx
+========================================================================
+import * as React from "react";
+import { Slot } from "@radix-ui/react-slot";
+import { cva, type VariantProps } from "class-variance-authority";
+import { cn } from "@/lib/utils";
+
+const buttonVariants = cva(
+  "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-[opacity,transform,background-color,color,box-shadow] duration-[var(--motion-quick)] ease-[var(--ease-out)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-40 active:scale-[0.98] [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0",
+  {
+    variants: {
+      variant: {
+        default: "bg-primary text-primary-foreground hover:opacity-90",
+        secondary:
+          "bg-secondary text-secondary-foreground hover:bg-muted",
+        outline:
+          "border border-border bg-transparent text-foreground hover:bg-muted",
+        ghost: "text-foreground hover:bg-muted",
+        danger: "bg-danger text-danger-foreground hover:opacity-90",
+      },
+      size: {
+        default: "h-11 px-4",
+        sm: "h-9 px-3 text-xs",
+        lg: "h-12 px-5",
+        icon: "size-11",
+      },
+    },
+    defaultVariants: {
+      variant: "default",
+      size: "default",
+    },
+  },
+);
+
+export interface ButtonProps
+  extends React.ButtonHTMLAttributes<HTMLButtonElement>,
+    VariantProps<typeof buttonVariants> {
+  asChild?: boolean;
+}
+
+const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
+  ({ className, variant, size, asChild = false, ...props }, ref) => {
+    const Comp = asChild ? Slot : "button";
+    return (
+      <Comp
+        className={cn(buttonVariants({ variant, size, className }))}
+        ref={ref}
+        {...props}
+      />
+    );
+  },
+);
+Button.displayName = "Button";
+
+export { Button, buttonVariants };
+
+========================================================================
+FILE: src/components/ui/input.tsx
+========================================================================
+import * as React from "react";
+import { cn } from "@/lib/utils";
+
+const Input = React.forwardRef<HTMLInputElement, React.ComponentProps<"input">>(
+  ({ className, type, ...props }, ref) => {
+    return (
+      <input
+        type={type}
+        className={cn(
+          "flex h-12 w-full rounded-lg border border-border bg-surface px-4 text-base text-foreground shadow-border transition-[box-shadow,border-color] duration-[var(--motion-quick)] placeholder:text-muted-foreground focus-visible:border-ring focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50",
+          className,
+        )}
+        ref={ref}
+        {...props}
+      />
+    );
+  },
+);
+Input.displayName = "Input";
+
+export { Input };
+
+========================================================================
+FILE: src/components/ui/badge.tsx
+========================================================================
+import type { ComponentProps } from "react";
+import { cva, type VariantProps } from "class-variance-authority";
+import { cn } from "@/lib/utils";
+
+const badgeVariants = cva(
+  "inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-medium tracking-wide",
+  {
+    variants: {
+      variant: {
+        default: "border-transparent bg-muted text-foreground",
+        ok: "border-transparent bg-ok-soft text-ok",
+        warn: "border-transparent bg-warn-soft text-warn",
+        danger: "border-transparent bg-danger-soft text-danger",
+        outline: "border-border text-muted-foreground",
+      },
+    },
+    defaultVariants: {
+      variant: "default",
+    },
+  },
+);
+
+export function Badge({
+  className,
+  variant,
+  ...props
+}: ComponentProps<"span"> & VariantProps<typeof badgeVariants>) {
+  return (
+    <span className={cn(badgeVariants({ variant }), className)} {...props} />
+  );
+}
+
+========================================================================
+FILE: src/components/checker-app.tsx
+========================================================================
+import { useMemo, useState } from "react";
+import {
+  AlertTriangle,
+  ArrowRight,
+  Camera,
+  Check,
+  Copy,
+  ExternalLink,
+  Globe,
+  Loader2,
+  Lock,
+  Route as RouteIcon,
+  ShieldAlert,
+} from "lucide-react";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { readApiError } from "@/lib/redirect/api-error";
+import { cn } from "@/lib/utils";
+import type { Hop, TraceResult } from "@/lib/redirect/types";
+
+const EXAMPLES = [
+  { label: "example.com", url: "https://example.com" },
+  { label: "http 転送", url: "https://httpbingo.org/redirect/3" },
+];
+
+function hopTone(hop: Hop): "ok" | "warn" | "danger" | "default" {
+  if (hop.blocked || hop.error) return "danger";
+  if (hop.status && hop.status >= 400) return "danger";
+  if (hop.status && hop.status >= 300) return "warn";
+  if (hop.status && hop.status >= 200 && hop.status < 300 && !hop.location)
+    return "ok";
+  return "default";
+}
+
+function hostOf(url: string) {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return url;
+  }
+}
+
+function schemeOf(url: string) {
+  try {
+    return new URL(url).protocol.replace(":", "");
+  } catch {
+    return "";
+  }
+}
+
+export function CheckerApp() {
+  const [url, setUrl] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [shooting, setShooting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<TraceResult | null>(null);
+  const [shotUrl, setShotUrl] = useState<string | null>(null);
+  const [shotPageUrl, setShotPageUrl] = useState<string | null>(null);
+  const [shotError, setShotError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  const finalHost = useMemo(
+    () => (result?.final ? hostOf(result.final) : ""),
+    [result],
+  );
+
+  async function runTrace(target = url) {
+    const next = target.trim();
+    if (!next) {
+      setError("URLを入力してください");
+      return;
+    }
+    setUrl(next);
+    setLoading(true);
+    setError(null);
+    setResult(null);
+    setShotError(null);
+    setShotPageUrl(null);
+    if (shotUrl) URL.revokeObjectURL(shotUrl);
+    setShotUrl(null);
+
+    try {
+      const res = await fetch("/api/trace", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: next }),
+      });
+      const body = await res.text();
+      let parsed: TraceResult & { error?: string };
+      try {
+        parsed = JSON.parse(body) as TraceResult & { error?: string };
+      } catch {
+        throw new Error(
+          res.status === 502 || body.trim().startsWith("<!")
+            ? "接続がタイムアウトしました。もう一度試してください。"
+            : `HTTP ${res.status}`,
+        );
+      }
+      if (!res.ok || parsed.error) {
+        throw new Error(parsed.error || `HTTP ${res.status}`);
+      }
+      setResult(parsed);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function takeShot() {
+    if (!url.trim()) return;
+    setShooting(true);
+    setShotError(null);
+    try {
+      const res = await fetch("/api/shot", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: url.trim() }),
+      });
+      if (!res.ok) {
+        throw new Error(await readApiError(res, "撮影に失敗しました"));
+      }
+      const pageUrl = decodeURIComponent(res.headers.get("X-Page-Url") || "");
+      const blob = await res.blob();
+      if (shotUrl) URL.revokeObjectURL(shotUrl);
+      setShotUrl(URL.createObjectURL(blob));
+      setShotPageUrl(pageUrl || null);
+    } catch (e) {
+      setShotError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setShooting(false);
+    }
+  }
+
+  async function copyFinal() {
+    if (!result?.final) return;
+    try {
+      await navigator.clipboard.writeText(result.final);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1200);
+    } catch {
+      setCopied(false);
+    }
+  }
+
+  const jsMismatch =
+    shotPageUrl && result?.final && shotPageUrl !== result.final;
+
+  return (
+    <main className="relative mx-auto min-h-dvh w-full max-w-3xl px-4 pb-16 pt-8 sm:px-6 sm:pt-12">
+      <header className="mb-8 sm:mb-10">
+        <p className="mb-3 font-mono text-xs font-medium tracking-[0.22em] text-muted-foreground uppercase">
+          Path lab
+        </p>
+        <h1 className="text-balance text-3xl font-medium tracking-tight text-foreground sm:text-4xl">
+          Redirect Checker
+        </h1>
+        <p className="mt-3 max-w-xl text-pretty text-sm leading-relaxed text-muted-foreground sm:text-base">
+          短縮URLや転送チェーンをホップごとに追跡し、到達先の見た目まで確認します。
+          JavaScript 転送はスクリーンショットで捕捉します。
+        </p>
+      </header>
+
+      <form
+        className="rounded-2xl bg-surface p-3 shadow-border sm:p-4"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void runTrace();
+        }}
+      >
+        <label htmlFor="target-url" className="sr-only">
+          調べるURL
+        </label>
+        <div className="flex flex-col gap-3 sm:flex-row">
+          <Input
+            id="target-url"
+            type="url"
+            inputMode="url"
+            autoComplete="off"
+            spellCheck={false}
+            placeholder="https://bit.ly/… または example.com"
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            className="font-mono text-sm sm:text-base"
+          />
+          <Button
+            type="submit"
+            disabled={loading}
+            className="h-12 shrink-0 px-6 sm:min-w-36"
+          >
+            {loading ? (
+              <>
+                <Loader2 className="animate-spin" />
+                確認中
+              </>
+            ) : (
+              <>
+                <RouteIcon />
+                確認する
+              </>
+            )}
+          </Button>
+        </div>
+        <div className="mt-3 flex flex-wrap gap-2">
+          {EXAMPLES.map((ex) => (
+            <button
+              key={ex.url}
+              type="button"
+              onClick={() => {
+                setUrl(ex.url);
+                void runTrace(ex.url);
+              }}
+              className="rounded-full border border-border px-3 py-1.5 text-xs text-muted-foreground transition-colors duration-[var(--motion-quick)] hover:bg-muted hover:text-foreground"
+            >
+              {ex.label}
+            </button>
+          ))}
+        </div>
+      </form>
+
+      {error ? (
+        <div
+          role="alert"
+          className="mt-6 flex gap-3 rounded-xl bg-danger-soft px-4 py-3 text-sm text-danger"
+        >
+          <ShieldAlert className="mt-0.5 size-4 shrink-0" />
+          <p className="min-w-0 break-words">{error}</p>
+        </div>
+      ) : null}
+
+      {result ? (
+        <section className="mt-8 space-y-6">
+          {result.warnings.length > 0 ? (
+            <ul className="space-y-2">
+              {result.warnings.map((w) => (
+                <li
+                  key={w}
+                  className="flex gap-3 rounded-xl bg-warn-soft px-4 py-3 text-sm text-warn"
+                >
+                  <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+                  <span>{w}</span>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+
+          <div className="rounded-2xl bg-surface p-4 shadow-border sm:p-5">
+            <div className="mb-4 flex items-center justify-between gap-3">
+              <h2 className="text-sm font-medium tracking-wide text-muted-foreground">
+                経路
+              </h2>
+              <Badge variant="outline">{result.hops.length} hops</Badge>
+            </div>
+            <ol className="space-y-0">
+              {result.hops.map((hop, i) => {
+                const tone = hopTone(hop);
+                return (
+                  <li key={`${hop.url}-${i}`} className="relative flex gap-3">
+                    <div className="flex w-6 shrink-0 flex-col items-center">
+                      <span
+                        className={cn(
+                          "mt-1 size-2.5 rounded-full",
+                          tone === "ok" && "bg-ok",
+                          tone === "warn" && "bg-warn",
+                          tone === "danger" && "bg-danger",
+                          tone === "default" && "bg-subtle",
+                        )}
+                      />
+                      {i < result.hops.length - 1 ? (
+                        <span className="w-px flex-1 bg-border" />
+                      ) : null}
+                    </div>
+                    <div className={cn("min-w-0 flex-1", i < result.hops.length - 1 ? "pb-5" : "")}>
+                      <p className="break-all font-mono text-xs leading-relaxed text-foreground sm:text-sm">
+                        {hop.url}
+                      </p>
+                      <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                        {hop.via ? (
+                          <Badge variant="outline">{hop.via}</Badge>
+                        ) : null}
+                        {hop.status ? (
+                          <Badge
+                            variant={
+                              hop.status >= 400
+                                ? "danger"
+                                : hop.status >= 300
+                                  ? "warn"
+                                  : "ok"
+                            }
+                          >
+                            {hop.status}
+                          </Badge>
+                        ) : null}
+                        {hop.blocked ? (
+                          <Badge variant="danger">拒否</Badge>
+                        ) : null}
+                        {hop.error ? (
+                          <Badge variant="danger">{hop.error}</Badge>
+                        ) : null}
+                      </div>
+                      {hop.blocked ? (
+                        <p className="mt-1 text-xs text-danger">{hop.blocked}</p>
+                      ) : null}
+                    </div>
+                  </li>
+                );
+              })}
+            </ol>
+            {result.note ? (
+              <p className="mt-4 text-xs text-muted-foreground">{result.note}</p>
+            ) : null}
+          </div>
+
+          {result.page ? (
+            <div className="rounded-2xl bg-surface p-4 shadow-border sm:p-5">
+              <h2 className="mb-3 text-sm font-medium tracking-wide text-muted-foreground">
+                ページ
+              </h2>
+              <p className="text-base font-medium text-foreground">
+                {result.page.title || "（タイトルなし）"}
+              </p>
+              {result.page.description ? (
+                <p className="mt-2 text-sm text-pretty text-muted-foreground">
+                  {result.page.description}
+                </p>
+              ) : null}
+              <dl className="mt-4 grid grid-cols-2 gap-3 text-sm sm:grid-cols-3">
+                <div className="rounded-lg bg-muted px-3 py-2">
+                  <dt className="text-xs text-muted-foreground">password</dt>
+                  <dd className="font-mono tabular-nums">
+                    {result.page.passwordInputs}
+                  </dd>
+                </div>
+                <div className="rounded-lg bg-muted px-3 py-2">
+                  <dt className="text-xs text-muted-foreground">iframe</dt>
+                  <dd className="font-mono tabular-nums">{result.page.iframes}</dd>
+                </div>
+                <div className="rounded-lg bg-muted px-3 py-2">
+                  <dt className="text-xs text-muted-foreground">form</dt>
+                  <dd className="font-mono tabular-nums">
+                    {result.page.forms.length}
+                  </dd>
+                </div>
+              </dl>
+              {result.page.forms.length > 0 ? (
+                <ul className="mt-3 space-y-2">
+                  {result.page.forms.map((f) => (
+                    <li
+                      key={`${f.method}-${f.action}`}
+                      className={cn(
+                        "rounded-lg px-3 py-2 font-mono text-xs break-all",
+                        f.crossHost
+                          ? "bg-danger-soft text-danger"
+                          : "bg-muted text-muted-foreground",
+                      )}
+                    >
+                      {f.method} → {f.action}
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+            </div>
+          ) : null}
+
+          <div className="rounded-2xl bg-surface p-4 shadow-border sm:p-5">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <h2 className="text-sm font-medium tracking-wide text-muted-foreground">
+                  最終到達先
+                </h2>
+                <p className="mt-2 break-all font-mono text-sm text-foreground">
+                  {result.final}
+                </p>
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  {result.complete ? (
+                    <Badge variant="ok">到達確認</Badge>
+                  ) : (
+                    <Badge variant="danger">未完了</Badge>
+                  )}
+                  {finalHost ? (
+                    <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+                      <Globe className="size-3.5" />
+                      {finalHost}
+                    </span>
+                  ) : null}
+                  {result.final && schemeOf(result.final) === "https" ? (
+                    <span className="inline-flex items-center gap-1 text-xs text-ok">
+                      <Lock className="size-3.5" />
+                      https
+                    </span>
+                  ) : null}
+                </div>
+              </div>
+              {result.final ? (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  onClick={() => void copyFinal()}
+                  aria-label="最終URLをコピー"
+                >
+                  {copied ? <Check /> : <Copy />}
+                </Button>
+              ) : null}
+            </div>
+            <p className="mt-4 text-xs leading-relaxed text-subtle">
+              {result.caveat}
+            </p>
+
+            {result.complete ? (
+              <div className="mt-5 flex flex-col gap-3 sm:flex-row">
+                <Button
+                  type="button"
+                  onClick={() => void takeShot()}
+                  disabled={shooting}
+                  className="sm:min-w-52"
+                >
+                  {shooting ? (
+                    <>
+                      <Loader2 className="animate-spin" />
+                      撮影中
+                    </>
+                  ) : (
+                    <>
+                      <Camera />
+                      スクリーンショット
+                    </>
+                  )}
+                </Button>
+                {result.final ? (
+                  <Button variant="outline" asChild>
+                    <a href={result.final} target="_blank" rel="noreferrer">
+                      到達先を開く
+                      <ExternalLink />
+                    </a>
+                  </Button>
+                ) : null}
+              </div>
+            ) : null}
+
+            {shotError ? (
+              <p className="mt-4 flex gap-2 text-sm text-danger">
+                <ShieldAlert className="mt-0.5 size-4 shrink-0" />
+                <span className="min-w-0 break-words">{shotError}</span>
+              </p>
+            ) : null}
+
+            {jsMismatch ? (
+              <p className="mt-4 flex gap-2 rounded-lg bg-warn-soft px-3 py-2 text-sm text-warn">
+                <ArrowRight className="mt-0.5 size-4 shrink-0" />
+                <span>
+                  ブラウザ上の最終URLが異なります（JS転送の可能性）
+                  <span className="mt-1 block break-all font-mono text-xs">
+                    {shotPageUrl}
+                  </span>
+                </span>
+              </p>
+            ) : shotPageUrl && result.final && shotPageUrl === result.final ? (
+              <p className="mt-4 text-sm text-ok">
+                ブラウザ上の最終URLも一致しました
+              </p>
+            ) : null}
+
+            {shotUrl ? (
+              <div className="mx-auto mt-6 w-[min(100%,280px)] rounded-[2rem] bg-elevated p-2 shadow-border">
+                <div className="overflow-hidden rounded-[1.4rem] bg-bg">
+                  <img
+                    src={shotUrl}
+                    alt="到達先ページのスクリーンショット"
+                    className="block h-auto w-full outline outline-1 -outline-offset-1 outline-white/10"
+                  />
+                </div>
+              </div>
+            ) : shooting ? (
+              <div className="mx-auto mt-6 flex h-[420px] w-[min(100%,280px)] items-center justify-center rounded-[2rem] bg-elevated p-2">
+                <div className="flex h-full w-full items-center justify-center rounded-[1.4rem] bg-muted">
+                  <Loader2 className="size-6 animate-spin text-muted-foreground" />
+                </div>
+              </div>
+            ) : null}
+          </div>
+        </section>
+      ) : null}
+    </main>
+  );
+}
+
+========================================================================
+FILE: public/favicon.svg
+========================================================================
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
+  <rect width="32" height="32" rx="8" fill="#0c0d0f"/>
+  <path d="M7 16h6l2-5 4 10 2-5h4" stroke="#d8dbe3" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
+

@@ -1,0 +1,9 @@
+{
+  "name": "traced-node-modules",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "playwright-core": "1.63.0"
+  }
+}
